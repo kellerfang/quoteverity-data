@@ -1,14 +1,18 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { parse } from "csv-parse/sync";
+import { unzipSync, strFromU8 } from "fflate";
 
 const URLS = {
   blsApi: "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+  blsTables: "https://www.bls.gov/oes/tables.htm",
   eiaElectricity: "https://api.eia.gov/v2/electricity/retail-sales/data/",
   eiaGas: "https://api.eia.gov/v2/natural-gas/pri/sum/data/",
   energyStarGas: "https://data.energystar.gov/resource/6sbi-yuk2.json?$limit=50000",
   energyStarHeatPump: "https://data.energystar.gov/resource/v7jr-74b4.json?$limit=50000",
   zipCsv: "https://raw.githubusercontent.com/ReadyAPIs-com/curated-us-zips/main/data/us-zips.csv",
+  beaMetroRpp: "https://apps.bea.gov/regional/zip/MARPP.zip",
+  beaStateRpp: "https://apps.bea.gov/regional/zip/SARPP.zip",
 };
 
 const TRADES = {
@@ -25,6 +29,7 @@ const STATE_CODES = new Set([
 const STATE_FIPS = {
   AL:"01",AK:"02",AZ:"04",AR:"05",CA:"06",CO:"08",CT:"09",DE:"10",DC:"11",FL:"12",GA:"13",HI:"15",ID:"16",IL:"17",IN:"18",IA:"19",KS:"20",KY:"21",LA:"22",ME:"23",MD:"24",MA:"25",MI:"26",MN:"27",MS:"28",MO:"29",MT:"30",NE:"31",NV:"32",NH:"33",NJ:"34",NM:"35",NY:"36",NC:"37",ND:"38",OH:"39",OK:"40",OR:"41",PA:"42",RI:"44",SC:"45",SD:"46",TN:"47",TX:"48",UT:"49",VT:"50",VA:"51",WA:"53",WV:"54",WI:"55",WY:"56",PR:"72",
 };
+const FIPS_STATE = Object.fromEntries(Object.entries(STATE_FIPS).map(([state, fips]) => [fips, state]));
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -66,22 +71,36 @@ const median = (values) => {
 
 const blsSeriesId = (state, occupation) => `OEU${state ? "S" : "N"}${state ? `${STATE_FIPS[state]}${"0".repeat(5)}` : "0".repeat(7)}${"0".repeat(6)}${occupation.replace("-", "")}08`;
 
-async function fetchBlsBatch(seriesIds) {
+async function fetchBlsBatch(seriesIds, releaseYear) {
   const response = await fetchChecked(URLS.blsApi, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ seriesid: seriesIds, startyear: "2025", endyear: "2025" }),
+    body: JSON.stringify({ seriesid: seriesIds, startyear: releaseYear, endyear: releaseYear }),
   });
   const payload = await response.json();
   if (payload.status !== "REQUEST_SUCCEEDED" || !Array.isArray(payload.Results?.series)) throw new Error(`BLS API request failed: ${JSON.stringify(payload.message ?? [])}`);
   return Object.fromEntries(payload.Results.series.map((series) => [series.seriesID, asNumber(series.data?.[0]?.value)]));
 }
 
-async function fetchBlsLabor() {
+async function currentBlsRelease() {
+  const html = await (await fetchChecked(URLS.blsTables)).text();
+  const releases = [...html.matchAll(/May\s+(20\d{2})/gi)].map((match) => Number(match[1])).filter((year) => year >= 2020 && year <= new Date().getUTCFullYear());
+  const year = Math.max(...releases);
+  if (!Number.isFinite(year)) throw new Error("Unable to identify the current BLS OEWS May release");
+  return { year: String(year), label: `May ${year}` };
+}
+
+async function fetchBlsLabor(previousLabor) {
+  const release = await currentBlsRelease();
+  if (previousLabor?.release === release.label
+    && Object.keys(previousLabor.stateFactors ?? {}).length >= 51
+    && Object.keys(previousLabor.nationalHourlyMedian ?? {}).length === Object.keys(TRADES).length) {
+    return previousLabor;
+  }
   const nationalIds = Object.values(TRADES).map((occupation) => blsSeriesId(null, occupation));
   const stateIds = [...STATE_CODES].flatMap((state) => Object.values(TRADES).map((occupation) => blsSeriesId(state, occupation)));
-  const values = { ...await fetchBlsBatch(nationalIds) };
-  for (let index = 0; index < stateIds.length; index += 25) Object.assign(values, await fetchBlsBatch(stateIds.slice(index, index + 25)));
+  const values = { ...await fetchBlsBatch(nationalIds, release.year) };
+  for (let index = 0; index < stateIds.length; index += 25) Object.assign(values, await fetchBlsBatch(stateIds.slice(index, index + 25), release.year));
 
   const nationalHourlyMedian = Object.fromEntries(Object.entries(TRADES).map(([trade, occupation]) => {
     const wage = values[blsSeriesId(null, occupation)];
@@ -95,7 +114,7 @@ async function fetchBlsLabor() {
       return [trade, round(clamp(wage / nationalHourlyMedian[trade], 0.6, 1.7))];
     }));
   }
-  return { release: "May 2025", statistic: "Hourly median wage", dataTypeCode: "08", nationalHourlyMedian, stateFactors };
+  return { release: release.label, statistic: "Hourly median wage", dataTypeCode: "08", nationalHourlyMedian, stateFactors };
 }
 
 async function fetchEia() {
@@ -188,15 +207,85 @@ async function fetchGeography() {
   return { zipCount: Object.keys(stateByZip).length, stateByZip };
 }
 
+const normalizeBeaArea = (value) => String(value ?? "")
+  .replace(/\s*\*\s*$/, "")
+  .replace(/\s*\(Metropolitan Statistical Area\)\s*$/i, "")
+  .normalize("NFKD")
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, "");
+
+function archiveFromBytes(bytes) {
+  return unzipSync(new Uint8Array(bytes));
+}
+
+function csvFromArchive(archive, prefix) {
+  const filename = Object.keys(archive).find((name) => name.startsWith(`${prefix}_`) && name.endsWith(".csv"));
+  if (!filename) throw new Error(`${prefix} CSV is missing from the BEA archive`);
+  return strFromU8(archive[filename]);
+}
+
+function releaseFromArchive(archive, prefix) {
+  const filename = Object.keys(archive).find((name) => name === `${prefix}__Footnotes.html`);
+  const footnotes = filename ? strFromU8(archive[filename]) : "";
+  const match = footnotes.match(/Last updated:\s*([^<\-]+)--\s*new statistics for\s*(\d{4})/i);
+  return match ? { releaseDate: match[1].trim(), year: match[2] } : null;
+}
+
+async function fetchBeaRegionalPrices() {
+  const [metroResponse, stateResponse] = await Promise.all([
+    fetchChecked(URLS.beaMetroRpp),
+    fetchChecked(URLS.beaStateRpp),
+  ]);
+  const [metroBytes, stateBytes] = await Promise.all([
+    metroResponse.arrayBuffer(),
+    stateResponse.arrayBuffer(),
+  ]);
+  const metroArchive = archiveFromBytes(metroBytes);
+  const stateArchive = archiveFromBytes(stateBytes);
+  const metroRows = parse(csvFromArchive(metroArchive, "MARPP"), { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true });
+  const stateRows = parse(csvFromArchive(stateArchive, "SARPP"), { columns: true, skip_empty_lines: true, trim: true, relax_column_count: true });
+  const numericYears = Object.keys(metroRows[0] ?? {}).filter((key) => /^\d{4}$/.test(key)).sort();
+  const year = numericYears.at(-1);
+  if (!year) throw new Error("BEA MARPP archive has no annual columns");
+  const release = releaseFromArchive(metroArchive, "MARPP");
+  if (!release || release.year !== year) throw new Error(`BEA release metadata does not match latest year ${year}`);
+
+  const metros = {};
+  for (const row of metroRows) {
+    if (String(row.TableName).trim() !== "MARPP" || Number(row.LineCode) !== 1) continue;
+    const geoFips = String(row.GeoFIPS).replace(/[^0-9]/g, "").padStart(5, "0");
+    if (geoFips === "00000" || geoFips === "00999") continue;
+    const name = String(row.GeoName)
+      .replace(/\s*\*\s*$/, "")
+      .replace(/\s*\(Metropolitan Statistical Area\)\s*$/i, "")
+      .trim();
+    const factor = asNumber(row[year]);
+    const key = normalizeBeaArea(name);
+    if (key && factor && factor >= 70 && factor <= 140) metros[key] = { name, geoFips, factor: round(factor / 100) };
+  }
+
+  const states = {};
+  for (const row of stateRows) {
+    if (String(row.TableName).trim() !== "SARPP" || Number(row.LineCode) !== 1) continue;
+    const geoFips = String(row.GeoFIPS).replace(/[^0-9]/g, "").padStart(5, "0");
+    const state = FIPS_STATE[geoFips.slice(0, 2)];
+    const factor = asNumber(row[year]);
+    if (state && factor && factor >= 70 && factor <= 140) states[state] = round(factor / 100);
+  }
+  return { year, releaseDate: release.releaseDate, states, metros };
+}
+
 const generatedAt = new Date().toISOString();
-const [labor, geography, energy, certifiedProducts] = await Promise.all([
-  fetchBlsLabor(),
+const previousModel = await readFile(new URL("../dist/model-data.json", import.meta.url), "utf8").then(JSON.parse).catch(() => null);
+const [labor, geography, energy, certifiedProducts, regionalPriceParity] = await Promise.all([
+  fetchBlsLabor(previousModel?.labor),
   fetchGeography(),
   fetchEia(),
   fetchCertifiedProducts(),
+  fetchBeaRegionalPrices(),
 ]);
 
-const fingerprintSource = JSON.stringify({ geography, labor, energy, certifiedProducts });
+const fingerprintSource = JSON.stringify({ geography, labor, energy, certifiedProducts, regionalPriceParity });
 const fingerprint = createHash("sha256").update(fingerprintSource).digest("hex").slice(0, 12);
 const model = {
   schemaVersion: 1,
@@ -214,13 +303,15 @@ const model = {
     { id: "energy-star-gas-wh", name: "ENERGY STAR certified gas water heaters", url: "https://data.energystar.gov/resource/6sbi-yuk2", period: "live certified-product dataset", checked: generatedAt, refresh: "weekly" },
     { id: "energy-star-hpwh", name: "ENERGY STAR certified heat-pump water heaters", url: "https://data.energystar.gov/resource/v7jr-74b4", period: "live certified-product dataset", checked: generatedAt, refresh: "weekly" },
     { id: "zip-reference", name: "ReadyAPIs curated U.S. ZIP reference", url: "https://github.com/ReadyAPIs-com/curated-us-zips", period: "current main branch", checked: generatedAt, refresh: "weekly check" },
+    { id: "bea-rpp", name: "BEA Regional Price Parities", url: "https://www.bea.gov/data/prices-inflation/regional-price-parities-state-and-metro-area", period: `${regionalPriceParity.year} · released ${regionalPriceParity.releaseDate}`, checked: generatedAt, refresh: "annual release, checked weekly" },
   ],
   geography,
   labor,
   energy,
   certifiedProducts,
+  regionalPriceParity,
 };
 
 await mkdir(new URL("../dist/", import.meta.url), { recursive: true });
 await writeFile(new URL("../dist/model-data.json", import.meta.url), `${JSON.stringify(model)}\n`);
-console.log(`Generated ${model.modelVersion}: ${geography.zipCount} ZIPs, ${Object.keys(labor.stateFactors).length} labor regions.`);
+console.log(`Generated ${model.modelVersion}: ${geography.zipCount} ZIPs, ${Object.keys(labor.stateFactors).length} labor regions, ${Object.keys(regionalPriceParity.metros).length} BEA metros.`);

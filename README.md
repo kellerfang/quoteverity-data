@@ -10,5 +10,6 @@ Current upstream sources:
 - U.S. Energy Information Administration monthly residential electricity and natural-gas prices.
 - EPA ENERGY STAR certified gas and heat-pump water-heater datasets.
 - ReadyAPIs curated U.S. ZIP reference, used under CC BY 4.0.
+- U.S. Bureau of Economic Analysis state and metro Regional Price Parity archives.
 
-The production job runs every Tuesday at 09:17 UTC from an isolated temporary checkout. Source frequencies differ: ENERGY STAR, EIA, and ZIP geography are checked each run, while OEWS normally changes annually. The site continues using its last validated snapshot if any update fails.
+The production job runs every Tuesday at 09:17 UTC from an isolated temporary checkout. Source frequencies differ: ENERGY STAR, EIA, ZIP geography, and BEA archives are checked each run, while OEWS and BEA RPP normally change annually. The site continues using its last validated snapshot if any update fails.

@@ -9,6 +9,7 @@
     "validate": "node scripts/validate.mjs"
   },
   "dependencies": {
-    "csv-parse": "6.1.0"
+    "csv-parse": "6.1.0",
+    "fflate": "0.8.2"
   }
 }
