@@ -6,9 +6,9 @@ The scheduled workflow downloads structured public releases, validates units and
 
 Current upstream sources:
 
-- U.S. Bureau of Labor Statistics May 2025 OEWS state and national wage files.
+- U.S. Bureau of Labor Statistics OEWS API, hourly median wage (data type 08) for the four relevant occupations at state and national level.
 - U.S. Energy Information Administration monthly residential electricity and natural-gas prices.
 - EPA ENERGY STAR certified gas and heat-pump water-heater datasets.
 - ReadyAPIs curated U.S. ZIP reference, used under CC BY 4.0.
 
-The job runs every Tuesday. Source frequencies differ: ENERGY STAR and EIA can change between runs, ZIP geography is checked monthly, and OEWS is replaced when BLS publishes a new annual file. The site continues using its last validated snapshot if any update fails.
+The job runs every Tuesday. Source frequencies differ: ENERGY STAR, EIA, and ZIP geography are checked each run, while OEWS normally changes annually. The site continues using its last validated snapshot if any update fails.

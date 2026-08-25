@@ -1,12 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import AdmZip from "adm-zip";
 import { parse } from "csv-parse/sync";
-import * as XLSX from "xlsx";
 
 const URLS = {
-  blsState: "https://www.bls.gov/oes/special-requests/oesm25st.zip",
-  blsNational: "https://www.bls.gov/oes/special-requests/oesm25nat.zip",
+  blsApi: "https://api.bls.gov/publicAPI/v2/timeseries/data/",
   eiaElectricity: "https://api.eia.gov/v2/electricity/retail-sales/data/",
   eiaGas: "https://api.eia.gov/v2/natural-gas/pri/sum/data/",
   energyStarGas: "https://data.energystar.gov/resource/6sbi-yuk2.json?$limit=50000",
@@ -24,6 +21,10 @@ const TRADES = {
 const STATE_CODES = new Set([
   "AL","AK","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY","PR",
 ]);
+
+const STATE_FIPS = {
+  AL:"01",AK:"02",AZ:"04",AR:"05",CA:"06",CO:"08",CT:"09",DE:"10",DC:"11",FL:"12",GA:"13",HI:"15",ID:"16",IL:"17",IN:"18",IA:"19",KS:"20",KY:"21",LA:"22",ME:"23",MD:"24",MA:"25",MI:"26",MN:"27",MS:"28",MO:"29",MT:"30",NE:"31",NV:"32",NH:"33",NJ:"34",NM:"35",NY:"36",NC:"37",ND:"38",OH:"39",OK:"40",OR:"41",PA:"42",RI:"44",SC:"45",SD:"46",TN:"47",TX:"48",UT:"49",VT:"50",VA:"51",WA:"53",WV:"54",WI:"55",WY:"56",PR:"72",
+};
 
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -63,38 +64,38 @@ const median = (values) => {
   return clean.length % 2 ? clean[middle] : (clean[middle - 1] + clean[middle]) / 2;
 };
 
-async function readBlsWorkbook(url) {
-  const response = await fetchChecked(url);
-  const archive = new AdmZip(Buffer.from(await response.arrayBuffer()));
-  const entry = archive.getEntries().find((candidate) => /\.xlsx$/i.test(candidate.entryName));
-  if (!entry) throw new Error(`No XLSX file found in ${url}`);
-  const workbook = XLSX.read(entry.getData(), { type: "buffer" });
-  const sheet = workbook.Sheets[workbook.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(sheet, { defval: null, raw: true });
+const blsSeriesId = (state, occupation) => `OEU${state ? "S" : "N"}${state ? `${STATE_FIPS[state]}${"0".repeat(5)}` : "0".repeat(7)}${"0".repeat(6)}${occupation.replace("-", "")}08`;
+
+async function fetchBlsBatch(seriesIds) {
+  const response = await fetchChecked(URLS.blsApi, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ seriesid: seriesIds, startyear: "2025", endyear: "2025" }),
+  });
+  const payload = await response.json();
+  if (payload.status !== "REQUEST_SUCCEEDED" || !Array.isArray(payload.Results?.series)) throw new Error(`BLS API request failed: ${JSON.stringify(payload.message ?? [])}`);
+  return Object.fromEntries(payload.Results.series.map((series) => [series.seriesID, asNumber(series.data?.[0]?.value)]));
 }
 
-function findOccupation(rows, code, state) {
-  const row = rows.find((candidate) => String(candidate.OCC_CODE ?? candidate.occ_code) === code && (!state || String(candidate.PRIM_STATE ?? candidate.prim_state) === state));
-  return row ? asNumber(row.H_MEDIAN ?? row.h_median) : null;
-}
+async function fetchBlsLabor() {
+  const nationalIds = Object.values(TRADES).map((occupation) => blsSeriesId(null, occupation));
+  const stateIds = [...STATE_CODES].flatMap((state) => Object.values(TRADES).map((occupation) => blsSeriesId(state, occupation)));
+  const values = { ...await fetchBlsBatch(nationalIds) };
+  for (let index = 0; index < stateIds.length; index += 25) Object.assign(values, await fetchBlsBatch(stateIds.slice(index, index + 25)));
 
-function buildLabor(stateRows, nationalRows) {
-  const nationalHourlyMedian = Object.fromEntries(Object.entries(TRADES).map(([trade, code]) => {
-    const wage = findOccupation(nationalRows, code);
-    if (!wage || wage < 10 || wage > 100) throw new Error(`Missing national BLS median for ${trade} (${code})`);
+  const nationalHourlyMedian = Object.fromEntries(Object.entries(TRADES).map(([trade, occupation]) => {
+    const wage = values[blsSeriesId(null, occupation)];
+    if (!wage || wage < 10 || wage > 100) throw new Error(`Missing national BLS hourly median for ${trade} (${occupation})`);
     return [trade, round(wage, 2)];
   }));
-
   const stateFactors = {};
   for (const state of STATE_CODES) {
-    const tradeFactors = {};
-    for (const [trade, code] of Object.entries(TRADES)) {
-      const wage = findOccupation(stateRows, code, state) ?? nationalHourlyMedian[trade];
-      tradeFactors[trade] = round(clamp(wage / nationalHourlyMedian[trade], 0.6, 1.7));
-    }
-    stateFactors[state] = tradeFactors;
+    stateFactors[state] = Object.fromEntries(Object.entries(TRADES).map(([trade, occupation]) => {
+      const wage = values[blsSeriesId(state, occupation)] ?? nationalHourlyMedian[trade];
+      return [trade, round(clamp(wage / nationalHourlyMedian[trade], 0.6, 1.7))];
+    }));
   }
-  return { release: "May 2025", nationalHourlyMedian, stateFactors };
+  return { release: "May 2025", statistic: "Hourly median wage", dataTypeCode: "08", nationalHourlyMedian, stateFactors };
 }
 
 async function fetchEia() {
@@ -134,6 +135,7 @@ async function fetchEia() {
     states[state] = {
       electricityCentsPerKwh: round(electric.value, 2),
       electricityPeriod: electric.period,
+      electricityFallback: !latestElectricity[state],
       naturalGasDollarsPerMcf: round(naturalGas.value, 2),
       naturalGasPeriod: naturalGas.period,
       naturalGasFallback: !latestGas[state],
@@ -187,15 +189,13 @@ async function fetchGeography() {
 }
 
 const generatedAt = new Date().toISOString();
-const [stateRows, nationalRows, geography, energy, certifiedProducts] = await Promise.all([
-  readBlsWorkbook(URLS.blsState),
-  readBlsWorkbook(URLS.blsNational),
+const [labor, geography, energy, certifiedProducts] = await Promise.all([
+  fetchBlsLabor(),
   fetchGeography(),
   fetchEia(),
   fetchCertifiedProducts(),
 ]);
 
-const labor = buildLabor(stateRows, nationalRows);
 const fingerprintSource = JSON.stringify({ geography, labor, energy, certifiedProducts });
 const fingerprint = createHash("sha256").update(fingerprintSource).digest("hex").slice(0, 12);
 const model = {
